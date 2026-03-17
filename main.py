@@ -25,7 +25,7 @@ BASE_DOMAIN = "https://xhamster45.desi"
 BASE_CHANNEL_URL = f"{BASE_DOMAIN}/channels"
 
 # Concurrency limits
-CHANNEL_CONCURRENCY_LIMIT = 5 # Scrape 5 channels at once
+CHANNEL_CONCURRENCY_LIMIT = 26 # Scrape 5 channels at once
 VIDEO_CONCURRENCY_LIMIT = 30   # 15 concurrent video checks per channel
 # -----------------------------------
 
@@ -205,7 +205,7 @@ async def process_page_and_batch(cffi_session, fb_session, page_url, semaphore, 
             unique_links.append(clean_url)
 
     if not unique_links:
-        return
+        return []
 
     print(f"🚀 [Channel: {channel_node}] Found {len(unique_links)} videos. Extracting...")
 
@@ -216,19 +216,9 @@ async def process_page_and_batch(cffi_session, fb_session, page_url, semaphore, 
     ]
     results = await asyncio.gather(*tasks)
 
+    # Return the valid results instead of saving the CSV immediately
     valid_results = [r for r in results if r is not None and r[0] != "Unknown Title"]
-
-    if valid_results:
-        # File named exactly as channel name + current page (e.g. xprime1.csv)
-        filename = f"{channel_node}{current_page}.csv"
-        headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
-
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-            writer.writerows(valid_results)
-
-        send_csv_to_telegram(filename)
+    return valid_results
 
 async def process_channel(cffi_session, fb_session, channel_name, max_pages, channel_semaphore, video_semaphore):
     async with channel_semaphore:
@@ -252,17 +242,42 @@ async def process_channel(cffi_session, fb_session, channel_name, max_pages, cha
             print(f"✅ Channel {channel_name} is already fully scraped (Max pages: {max_pages}).")
             return
         
+        accumulated_data = []
+        start_batch_page = start_page
+
         for current_page in range(start_page, max_pages + 1):
             page_url = f"{BASE_CHANNEL_URL}/{channel_name}" if current_page == 1 else f"{BASE_CHANNEL_URL}/{channel_name}/{current_page}"
-            await process_page_and_batch(cffi_session, fb_session, page_url, video_semaphore, current_page, channel_name)
             
-            # --- SAVE PROGRESS TO FIREBASE ---
-            try:
-                async with fb_session.put(progress_url, json=current_page) as put_resp:
-                    pass # Silently update the highest completed page
-            except Exception as e:
-                print(f"   ⚠️ Failed to save progress for {channel_name}: {e}")
-            # -------------------------------------------
+            page_results = await process_page_and_batch(cffi_session, fb_session, page_url, video_semaphore, current_page, channel_name)
+            
+            if page_results:
+                accumulated_data.extend(page_results)
+            
+            # --- IF WE HIT 100+ ITEMS OR IT'S THE VERY LAST PAGE ---
+            if len(accumulated_data) >= 100 or current_page == max_pages:
+                if accumulated_data:
+                    # Save the accumulated results
+                    filename = f"{channel_name}_pages_{start_batch_page}-{current_page}.csv"
+                    headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
+
+                    with open(filename, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(headers)
+                        writer.writerows(accumulated_data)
+
+                    send_csv_to_telegram(filename)
+                    
+                    # Empty the list to start fresh for the next batch
+                    accumulated_data = []
+                    start_batch_page = current_page + 1
+
+                # --- SAVE PROGRESS TO FIREBASE (ONLY AFTER SUCCESSFUL BATCH) ---
+                try:
+                    async with fb_session.put(progress_url, json=current_page) as put_resp:
+                        pass # Silently update the highest completed page
+                except Exception as e:
+                    print(f"   ⚠️ Failed to save progress for {channel_name}: {e}")
+                # -------------------------------------------
         
         print(f"\n✅ Finished processing channel: {channel_name}")
 
@@ -307,9 +322,9 @@ async def main_async():
     total_time = time.time() - start_time
     print(f"\n🎉 ALL SCRAPING COMPLETED in {total_time:.2f} seconds!")
     
-    # --- HARD STOP PROCESS ---
-    print("🛑 Hard stopping the process at the OS level...")
-    os._exit(0) 
+    # --- KEEP ALIVE FOR RENDER ---
+    print("🛑 Scraping finished. Keeping dummy server alive to prevent Render restart loop...")
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
     asyncio.run(main_async())
