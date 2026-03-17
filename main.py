@@ -25,7 +25,7 @@ BASE_DOMAIN = "https://xhamster45.desi"
 BASE_CHANNEL_URL = f"{BASE_DOMAIN}/channels"
 
 # Concurrency limits
-CHANNEL_CONCURRENCY_LIMIT = 26 # Scrape 5 channels at once
+CHANNEL_CONCURRENCY_LIMIT = 5 # Scrape 5 channels at once
 VIDEO_CONCURRENCY_LIMIT = 30   # 15 concurrent video checks per channel
 # -----------------------------------
 
