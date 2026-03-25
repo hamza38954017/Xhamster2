@@ -17,16 +17,18 @@ TELEGRAM_CHAT_ID = "7369364451"
 # Your Firebase Database URL
 FIREBASE_DB_URL = "https://xhamster-70a9b-default-rtdb.firebaseio.com"
 
-# Paste your channel names and max pages here
-CHANNELS = ["aunt-judys-xxx", "adult-time", "trike-patrol", "swappz", "mommys-boy", "my-friends-hot-mom-channel", "fakings", "hotwife-xxx", "freeuse", "brattysis", "xtime-network", "mmv-films", "indian-real-porn", "family-xxx", "shagging-moms", "inkasex", "asian-sex-diary", "alfacontent-world", "av-jiali", "shop-lyfter", "fill-up-my-stepmom", "sunny-leone", "tuktuk-patrol", "queen-star-desi", "nuru-massage", "indian-threesome"]
-MAX_PAGES = [22, 48, 17, 10, 8, 7, 52, 8, 9, 10, 265, 125, 1, 10, 92, 9, 18, 374, 28, 17, 4, 1, 11, 1, 29, 1]
+# Kept solely for checking if a video already exists in these legacy nodes
+LEGACY_CHANNELS = [
+    "Perv-city", "pantyhose-me-porn-videos", "pro-am-entertainment", "milf-bundle", "karups-older-women", "cuckold-milf", "old-x", "banned-sex-tapes", "mstx", "sylvia-sucked", "exxx-teens", "pascals-sub-sluts", "grandmams", "john-tron-x", "amateur-lapdancer", "blacks-on-blondes", "voyeur-house-tv", "hard-x", "king-of-amateur", "adult-auditions", "vintage-usa", "creampie-in-asia", "celeb-porn-archive", "dire-desires", "older-woman-fun", "jeffs-models", "hollandsche-passie", "madbros", "18-year-old-indian", "jax-slay-her", "only-full-porn-movie", "fuck-me-hard", "nasty-matures-and-dirty-grannies-club", "monger-in-asia", "property-sex", "old-goes-young", "tabu-film", "jav-official", "busty-bexx", "asian-porn-collection", "darrenblazeent", "czech-taxi", "missax", "the-upper-floor-by-kink", "wowgirls", "ugly-but-hot", "erotica-x", "cum4k", "xlgirls", "super-babes", "lusty-grandmas", "heavy-on-hotties", "she-got-butt-fucked", "family-x", "femdom-austria", "aunt-judys", "she-seduced-me", "my-porn-family", "centoxcentovod", "sugar-daddy-porn", "wicked-sexy-melanie", "40somethingmag", "big-tits-world", "luxure", "xtime-grannies", "breedme", "anal-mom", "anilos", "red-bottom-productions", "sperm-mania", "homemade-wives", "asian-milfs-n-teens", "vere-casalinghe-italia", "mommy4k", "my-baby-sitters-club", "bratty-milf", "oldies-privat", "smooth-time", "samurai-from-japan-with-passion", "twistys-network", "brutal-x", "tampa-bukkake-faphouse", "hussie-pass", "hardcore-gangbang-by-kink", "true-anal", "beate-uhse-movie", "lustery-channel", "theflourishxxx", "real-couples-channel", "girls-rimming", "horror-porn", "video-torino-erotica", "porn-india-studio", "your-uncut", "girlcum", "dogg-vision", "kingsofamateur", "british-blue-movies", "casting-girls-and-first-porno", "all-about-pee"
+]
 
 BASE_DOMAIN = "https://xhamster45.desi"
-BASE_CHANNEL_URL = f"{BASE_DOMAIN}/channels"
 
-# Concurrency limits
-CHANNEL_CONCURRENCY_LIMIT = 26 # Scrape 5 channels at once
-VIDEO_CONCURRENCY_LIMIT = 30   # 15 concurrent video checks per channel
+# New constraints
+VIDEO_CONCURRENCY_LIMIT = 100
+START_ID = 1
+END_ID = 22875
+BATCH_SIZE = 1000
 # -----------------------------------
 
 PROXY_POOL = []
@@ -38,8 +40,8 @@ def send_csv_to_telegram(filepath):
             response = requests.post(url, data={'chat_id': TELEGRAM_CHAT_ID}, files={'document': f})
             if response.status_code == 200:
                 print(f"📤 Successfully sent {filepath} to Telegram!")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Telegram error: {e}")
 
 def fetch_free_proxies():
     print("🔄 Downloading fresh list of elite free proxies...")
@@ -96,22 +98,41 @@ async def fetch_html_zero_loss(cffi_session, url):
             if proxy_url in PROXY_POOL:
                 PROXY_POOL.remove(proxy_url)
 
-async def process_single_video(cffi_session, fb_session, semaphore, url, channel_node):
-    async with semaphore:
-        # 1. GENERATE UNIQUE ID
-        video_id = url.split('-')[-1]
-        
-        # USE DYNAMIC NODE BASED ON CHANNEL
-        firebase_node_url = f"{FIREBASE_DB_URL}/{channel_node}/{video_id}.json"
+async def check_channel(fb_session, channel, video_id):
+    """Helper to check if video exists in a specific legacy channel node"""
+    channel_node_url = f"{FIREBASE_DB_URL}/{channel}/{video_id}.json"
+    try:
+        async with fb_session.get(channel_node_url) as check_resp:
+            if await check_resp.json() is not None:
+                return True
+    except:
+        pass
+    return False
 
-        # 2. CHECK FIREBASE IF ALREADY EXISTS
+async def process_single_video(cffi_session, fb_session, semaphore, video_id_num):
+    video_id = str(video_id_num)
+    
+    # Using format requested. If standard tube format is required, change to f"{BASE_DOMAIN}/videos/{video_id}"
+    url = f"{BASE_DOMAIN}/{video_id}" 
+
+    async with semaphore:
+        # 1. CHECK FIREBASE 'all' NODE FIRST (Fastest)
+        all_node_url = f"{FIREBASE_DB_URL}/all/{video_id}.json"
         try:
-            async with fb_session.get(firebase_node_url) as check_resp:
+            async with fb_session.get(all_node_url) as check_resp:
                 if await check_resp.json() is not None:
-                    print(f"   ⏭️ Skipped: {video_id} is already in Firebase under /{channel_node}.")
+                    print(f"   ⏭️ Skipped: {video_id} is already in /all node.")
                     return None
-        except Exception as e:
+        except:
             pass
+
+        # 2. CHECK ALL LEGACY CHANNEL NODES (Concurrently to save time)
+        channel_checks = [check_channel(fb_session, ch, video_id) for ch in LEGACY_CHANNELS]
+        channel_results = await asyncio.gather(*channel_checks)
+        
+        if any(channel_results):
+            print(f"   ⏭️ Skipped: {video_id} is already in a legacy channel node.")
+            return None
 
         # 3. SCRAPE THE DATA
         html = await fetch_html_zero_loss(cffi_session, url)
@@ -163,7 +184,11 @@ async def process_single_video(cffi_session, fb_session, semaphore, url, channel
             if preview_match:
                 preview_url = preview_match.group(1).replace('\\/', '/')
 
-        # 4. INSTANT FIREBASE UPLOAD TO DYNAMIC NODE (No Streaming URL)
+        if title == "Unknown Title" and not tags_array:
+            # Page not found or invalid format
+            return None
+
+        # 4. INSTANT FIREBASE UPLOAD TO 'all' NODE
         firebase_payload = {
             "title": title,
             "channel_name": channel_name,
@@ -179,107 +204,14 @@ async def process_single_video(cffi_session, fb_session, semaphore, url, channel
         }
 
         try:
-            async with fb_session.put(firebase_node_url, json=firebase_payload) as put_resp:
+            async with fb_session.put(all_node_url, json=firebase_payload) as put_resp:
                 if put_resp.status == 200:
-                    print(f"   🔥 Saved to DB (/{channel_node}): {title[:20]}...")
+                    print(f"   🔥 Saved to DB (/all): {title[:20]}...")
         except Exception as e:
             print(f"   ❌ DB Error: {e}")
 
         csv_tags_string = ", ".join(tags_array)
         return [title, channel_name, csv_tags_string, duration, views, likes, dislikes, thumbnail_url, preview_url, url]
-
-async def process_page_and_batch(cffi_session, fb_session, page_url, semaphore, current_page, channel_node):
-    print(f"\n📄 [Channel: {channel_node}] Gathering links from: {page_url}")
-
-    html = await fetch_html_zero_loss(cffi_session, page_url)
-
-    links_absolute = re.findall(r'href="(https://xhamster45\.desi/videos/[^"]+)"', html)
-    links_relative = re.findall(r'href="(/videos/[^"]+)"', html)
-
-    unique_links = []
-    all_links = links_absolute + [f"{BASE_DOMAIN}{l}" for l in links_relative]
-
-    for link in all_links:
-        clean_url = link.split('#')[0].split('?')[0]
-        if clean_url not in unique_links and clean_url != f"{BASE_DOMAIN}/videos":
-            unique_links.append(clean_url)
-
-    if not unique_links:
-        return []
-
-    print(f"🚀 [Channel: {channel_node}] Found {len(unique_links)} videos. Extracting...")
-
-    # EXPLICITLY CREATE TASKS TO FIX AIOHTTP ERROR
-    tasks = [
-        asyncio.create_task(process_single_video(cffi_session, fb_session, semaphore, url, channel_node)) 
-        for url in unique_links
-    ]
-    results = await asyncio.gather(*tasks)
-
-    # Return the valid results instead of saving the CSV immediately
-    valid_results = [r for r in results if r is not None and r[0] != "Unknown Title"]
-    return valid_results
-
-async def process_channel(cffi_session, fb_session, channel_name, max_pages, channel_semaphore, video_semaphore):
-    async with channel_semaphore:
-        print(f"\n🎬 Starting to scrape channel: {channel_name} (Up to {max_pages} pages)")
-        
-        # --- FETCH PROGRESS FROM FIREBASE ---
-        start_page = 1
-        progress_url = f"{FIREBASE_DB_URL}/scraping_progress/{channel_name}.json"
-        try:
-            async with fb_session.get(progress_url) as resp:
-                if resp.status == 200:
-                    last_page = await resp.json()
-                    if last_page and isinstance(last_page, int):
-                        start_page = last_page + 1
-                        print(f"   🔄 Resuming {channel_name} from page {start_page}...")
-        except Exception as e:
-            print(f"   ⚠️ Could not fetch progress for {channel_name}, starting from page 1.")
-        # ----------------------------------------------
-
-        if start_page > max_pages:
-            print(f"✅ Channel {channel_name} is already fully scraped (Max pages: {max_pages}).")
-            return
-        
-        accumulated_data = []
-        start_batch_page = start_page
-
-        for current_page in range(start_page, max_pages + 1):
-            page_url = f"{BASE_CHANNEL_URL}/{channel_name}" if current_page == 1 else f"{BASE_CHANNEL_URL}/{channel_name}/{current_page}"
-            
-            page_results = await process_page_and_batch(cffi_session, fb_session, page_url, video_semaphore, current_page, channel_name)
-            
-            if page_results:
-                accumulated_data.extend(page_results)
-            
-            # --- IF WE HIT 100+ ITEMS OR IT'S THE VERY LAST PAGE ---
-            if len(accumulated_data) >= 100 or current_page == max_pages:
-                if accumulated_data:
-                    # Save the accumulated results
-                    filename = f"{channel_name}_pages_{start_batch_page}-{current_page}.csv"
-                    headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
-
-                    with open(filename, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(headers)
-                        writer.writerows(accumulated_data)
-
-                    send_csv_to_telegram(filename)
-                    
-                    # Empty the list to start fresh for the next batch
-                    accumulated_data = []
-                    start_batch_page = current_page + 1
-
-                # --- SAVE PROGRESS TO FIREBASE (ONLY AFTER SUCCESSFUL BATCH) ---
-                try:
-                    async with fb_session.put(progress_url, json=current_page) as put_resp:
-                        pass # Silently update the highest completed page
-                except Exception as e:
-                    print(f"   ⚠️ Failed to save progress for {channel_name}: {e}")
-                # -------------------------------------------
-        
-        print(f"\n✅ Finished processing channel: {channel_name}")
 
 # --- Render Web Service Dummy Server ---
 async def health_check(request):
@@ -299,30 +231,66 @@ async def start_dummy_server():
 async def main_async():
     global PROXY_POOL
     
-    # Start the dummy server so Render doesn't crash the app
     await start_dummy_server()
     
     start_time = time.time()
     PROXY_POOL = fetch_free_proxies()
     
-    channel_semaphore = asyncio.Semaphore(CHANNEL_CONCURRENCY_LIMIT)
     video_semaphore = asyncio.Semaphore(VIDEO_CONCURRENCY_LIMIT)
 
-    async with AsyncSession() as cffi_session, aiohttp.ClientSession() as fb_session:
-        # EXPLICITLY CREATE TASKS TO FIX AIOHTTP ERROR
-        tasks = []
-        for channel_name, pages in zip(CHANNELS, MAX_PAGES):
-            task = asyncio.create_task(
-                process_channel(cffi_session, fb_session, channel_name, pages, channel_semaphore, video_semaphore)
-            )
-            tasks.append(task)
+    # Increased aiohttp connection limits to handle simultaneous DB checks smoothly
+    connector = aiohttp.TCPConnector(limit=5000)
+
+    async with AsyncSession() as cffi_session, aiohttp.ClientSession(connector=connector) as fb_session:
+        # Create all tasks upfront
+        tasks = [
+            process_single_video(cffi_session, fb_session, video_semaphore, vid_id)
+            for vid_id in range(START_ID, END_ID + 1)
+        ]
+        
+        print(f"\n🚀 Starting direct scrape of {END_ID - START_ID + 1} videos with {VIDEO_CONCURRENCY_LIMIT} concurrency...\n")
+        
+        accumulated_data = []
+        batch_count = 1
+        
+        # Process results as soon as they complete
+        for coroutine in asyncio.as_completed(tasks):
+            result = await coroutine
             
-        await asyncio.gather(*tasks)
+            if result:
+                accumulated_data.append(result)
+                
+                # Check if we hit the 1000 TG limit
+                if len(accumulated_data) >= BATCH_SIZE:
+                    filename = f"scraped_direct_batch_{batch_count}.csv"
+                    headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
+
+                    with open(filename, 'w', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(headers)
+                        writer.writerows(accumulated_data)
+
+                    send_csv_to_telegram(filename)
+                    
+                    # Clear the list safely to prepare for the next batch
+                    accumulated_data.clear()
+                    batch_count += 1
+
+        # Send any leftover data that didn't reach the 1000 mark at the very end
+        if accumulated_data:
+            filename = f"scraped_direct_batch_final.csv"
+            headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
+
+            with open(filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                writer.writerows(accumulated_data)
+
+            send_csv_to_telegram(filename)
 
     total_time = time.time() - start_time
     print(f"\n🎉 ALL SCRAPING COMPLETED in {total_time:.2f} seconds!")
     
-    # --- KEEP ALIVE FOR RENDER ---
     print("🛑 Scraping finished. Keeping dummy server alive to prevent Render restart loop...")
     await asyncio.Event().wait()
 
