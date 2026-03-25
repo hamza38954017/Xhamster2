@@ -19,7 +19,7 @@ FIREBASE_DB_URL = "https://xhamster-70a9b-default-rtdb.firebaseio.com"
 BASE_DOMAIN = "https://xhamster45.desi"
 
 # Limits & Bounds
-VIDEO_CONCURRENCY_LIMIT = 100
+VIDEO_CONCURRENCY_LIMIT = 30
 START_ID = 1
 END_ID = 22875
 BATCH_SIZE = 1000
