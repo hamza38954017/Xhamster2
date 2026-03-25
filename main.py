@@ -19,7 +19,7 @@ FIREBASE_DB_URL = "https://xhamster-70a9b-default-rtdb.firebaseio.com"
 BASE_DOMAIN = "https://xhamster45.desi"
 
 # Limits & Bounds
-VIDEO_CONCURRENCY_LIMIT = 5
+VIDEO_CONCURRENCY_LIMIT = 100 # Scrapes exactly 100 at a time
 START_ID = 1
 END_ID = 22875
 BATCH_SIZE = 1000
@@ -120,103 +120,102 @@ async def fetch_dynamic_nodes(fb_session):
         print(f"⚠️ Error fetching dynamic nodes: {e}")
     return []
 
-async def process_single_video(cffi_session, fb_session, semaphore, video_id_num):
+async def process_single_video(cffi_session, fb_session, video_id_num):
     video_id = str(video_id_num)
     url = f"{BASE_DOMAIN}/{video_id}" 
 
-    async with semaphore:
-        # 1. CHECK FIREBASE 'all' NODE FIRST (Fastest check)
-        if await check_firebase_node(fb_session, "all", video_id):
-            print(f"   ⏭️ Skipped: {video_id} is already in /all node.")
+    # 1. CHECK FIREBASE 'all' NODE FIRST (Fastest check)
+    if await check_firebase_node(fb_session, "all", video_id):
+        print(f"   ⏭️ Skipped: {video_id} is already in /all node.")
+        return None
+
+    # 2. CHECK ALL DYNAMIC NODES CONCURRENTLY
+    if DYNAMIC_NODES:
+        node_checks = [check_firebase_node(fb_session, node, video_id) for node in DYNAMIC_NODES]
+        node_results = await asyncio.gather(*node_checks)
+        
+        if any(node_results):
+            print(f"   ⏭️ Skipped: {video_id} is already in a dynamic channel node.")
             return None
 
-        # 2. CHECK ALL DYNAMIC NODES CONCURRENTLY
-        if DYNAMIC_NODES:
-            node_checks = [check_firebase_node(fb_session, node, video_id) for node in DYNAMIC_NODES]
-            node_results = await asyncio.gather(*node_checks)
-            
-            if any(node_results):
-                print(f"   ⏭️ Skipped: {video_id} is already in a dynamic channel node.")
-                return None
+    # 3. SCRAPE THE DATA
+    html = await fetch_html_zero_loss(cffi_session, url)
 
-        # 3. SCRAPE THE DATA
-        html = await fetch_html_zero_loss(cffi_session, url)
+    title, channel_name, duration = "Unknown Title", "Unknown Channel", 0
+    views, likes, dislikes = 0, 0, 0
+    tags_array = []
+    thumbnail_url, preview_url = "", "Preview not found"
 
-        title, channel_name, duration = "Unknown Title", "Unknown Channel", 0
-        views, likes, dislikes = 0, 0, 0
-        tags_array = []
-        thumbnail_url, preview_url = "", "Preview not found"
+    title_match = re.search(r'<title>(.*?)</title>', html)
+    if title_match:
+        title = title_match.group(1).replace(" | xHamster", "").strip()
 
-        title_match = re.search(r'<title>(.*?)</title>', html)
-        if title_match:
-            title = title_match.group(1).replace(" | xHamster", "").strip()
+    data = {}
+    json_match = re.search(r'window\.initials\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
+    if json_match:
+        try: data = json.loads(json_match.group(1))
+        except: pass
 
-        data = {}
-        json_match = re.search(r'window\.initials\s*=\s*({.+?});\s*</script>', html, re.DOTALL)
-        if json_match:
-            try: data = json.loads(json_match.group(1))
-            except: pass
-
-        if not data:
-            script_matches = re.findall(r'<script[^>]*>(.*?videoModel.*?)</script>', html, re.DOTALL | re.IGNORECASE)
-            for script in script_matches:
-                try:
-                    start, end = script.find('{'), script.rfind('}') + 1
-                    data = json.loads(script[start:end])
-                    break
-                except: continue
-
-        if data:
+    if not data:
+        script_matches = re.findall(r'<script[^>]*>(.*?videoModel.*?)</script>', html, re.DOTALL | re.IGNORECASE)
+        for script in script_matches:
             try:
-                vid_entity = data.get("videoEntity", {})
-                vid_model = data.get("videoModel", {})
+                start, end = script.find('{'), script.rfind('}') + 1
+                data = json.loads(script[start:end])
+                break
+            except: continue
 
-                title = vid_entity.get("title", title)
-                channel_name = vid_model.get("channelModel", {}).get("channelName", vid_model.get("author", {}).get("name", "Unknown Channel"))
-
-                tags_array = [t.get("name") for t in data.get("videoTagsComponent", {}).get("tags", []) if t.get("name")]
-
-                duration, views = vid_entity.get("duration", 0), vid_entity.get("views", 0)
-                likes, dislikes = vid_entity.get("rating", {}).get("likes", 0), vid_entity.get("rating", {}).get("dislikes", 0)
-                thumbnail_url = vid_entity.get("thumbBig", data.get("videoInfo", {}).get("thumbUrl", ""))
-
-                found_preview = recursive_preview_search(data)
-                if found_preview: preview_url = found_preview
-            except: pass
-
-        if preview_url == "Preview not found":
-            preview_match = re.search(r'(https?:\/\/[^\s<>"\'\\]*(?:preview|trailer|heat-preview)[^\s<>"\'\\]*\.mp4)', html, re.IGNORECASE)
-            if preview_match:
-                preview_url = preview_match.group(1).replace('\\/', '/')
-
-        if title == "Unknown Title" and not tags_array:
-            # Page not found or invalid format
-            return None
-
-        # 4. INSTANT FIREBASE UPLOAD TO 'all' NODE
-        firebase_payload = {
-            "title": title,
-            "channel_name": channel_name,
-            "tags": tags_array,
-            "duration": duration,
-            "views": views,
-            "likes": likes,
-            "dislikes": dislikes,
-            "thumbnail_url": thumbnail_url,
-            "preview_url": preview_url,
-            "page_url": url,
-            "scraped_at": time.time()
-        }
-
+    if data:
         try:
-            async with fb_session.put(f"{FIREBASE_DB_URL}/all/{video_id}.json", json=firebase_payload) as put_resp:
-                if put_resp.status == 200:
-                    print(f"   🔥 Saved to DB (/all): {title[:20]}...")
-        except Exception as e:
-            print(f"   ❌ DB Error: {e}")
+            vid_entity = data.get("videoEntity", {})
+            vid_model = data.get("videoModel", {})
 
-        csv_tags_string = ", ".join(tags_array)
-        return [title, channel_name, csv_tags_string, duration, views, likes, dislikes, thumbnail_url, preview_url, url]
+            title = vid_entity.get("title", title)
+            channel_name = vid_model.get("channelModel", {}).get("channelName", vid_model.get("author", {}).get("name", "Unknown Channel"))
+
+            tags_array = [t.get("name") for t in data.get("videoTagsComponent", {}).get("tags", []) if t.get("name")]
+
+            duration, views = vid_entity.get("duration", 0), vid_entity.get("views", 0)
+            likes, dislikes = vid_entity.get("rating", {}).get("likes", 0), vid_entity.get("rating", {}).get("dislikes", 0)
+            thumbnail_url = vid_entity.get("thumbBig", data.get("videoInfo", {}).get("thumbUrl", ""))
+
+            found_preview = recursive_preview_search(data)
+            if found_preview: preview_url = found_preview
+        except: pass
+
+    if preview_url == "Preview not found":
+        preview_match = re.search(r'(https?:\/\/[^\s<>"\'\\]*(?:preview|trailer|heat-preview)[^\s<>"\'\\]*\.mp4)', html, re.IGNORECASE)
+        if preview_match:
+            preview_url = preview_match.group(1).replace('\\/', '/')
+
+    if title == "Unknown Title" and not tags_array:
+        # Page not found or invalid format
+        return None
+
+    # 4. INSTANT FIREBASE UPLOAD TO 'all' NODE
+    firebase_payload = {
+        "title": title,
+        "channel_name": channel_name,
+        "tags": tags_array,
+        "duration": duration,
+        "views": views,
+        "likes": likes,
+        "dislikes": dislikes,
+        "thumbnail_url": thumbnail_url,
+        "preview_url": preview_url,
+        "page_url": url,
+        "scraped_at": time.time()
+    }
+
+    try:
+        async with fb_session.put(f"{FIREBASE_DB_URL}/all/{video_id}.json", json=firebase_payload) as put_resp:
+            if put_resp.status == 200:
+                print(f"   🔥 Saved to DB (/all): {title[:20]}...")
+    except Exception as e:
+        print(f"   ❌ DB Error: {e}")
+
+    csv_tags_string = ", ".join(tags_array)
+    return [title, channel_name, csv_tags_string, duration, views, likes, dislikes, thumbnail_url, preview_url, url]
 
 # --- Render Web Service Dummy Server ---
 async def health_check(request):
@@ -240,51 +239,52 @@ async def main_async():
     
     start_time = time.time()
     PROXY_POOL = fetch_free_proxies()
-    
-    video_semaphore = asyncio.Semaphore(VIDEO_CONCURRENCY_LIMIT)
 
-    # Increased aiohttp connection limits to handle simultaneous DB checks smoothly
-    connector = aiohttp.TCPConnector(limit=5000)
+    # LOWERED TCP CONNECTIONS TO SAVE RAM ON FREE TIER
+    connector = aiohttp.TCPConnector(limit=150)
 
     async with AsyncSession() as cffi_session, aiohttp.ClientSession(connector=connector) as fb_session:
-        # Fetch the dynamic nodes right at the start
         DYNAMIC_NODES = await fetch_dynamic_nodes(fb_session)
-
-        # Create all tasks upfront
-        tasks = [
-            process_single_video(cffi_session, fb_session, video_semaphore, vid_id)
-            for vid_id in range(START_ID, END_ID + 1)
-        ]
         
-        print(f"\n🚀 Starting direct scrape of {END_ID - START_ID + 1} videos with {VIDEO_CONCURRENCY_LIMIT} concurrency...\n")
+        print(f"\n🚀 Starting chunked direct scrape. IDs {START_ID} to {END_ID}...\n")
         
         accumulated_data = []
         batch_count = 1
         
-        # Process results as soon as they complete
-        for coroutine in asyncio.as_completed(tasks):
-            result = await coroutine
+        # MEMORY FIX: Process strictly in chunks of 100
+        for i in range(START_ID, END_ID + 1, VIDEO_CONCURRENCY_LIMIT):
+            chunk_end = min(i + VIDEO_CONCURRENCY_LIMIT, END_ID + 1)
             
-            if result:
-                accumulated_data.append(result)
+            # Create ONLY 100 tasks at a time
+            tasks = [
+                process_single_video(cffi_session, fb_session, vid_id)
+                for vid_id in range(i, chunk_end)
+            ]
+            
+            # Wait for this batch of 100 to finish
+            results = await asyncio.gather(*tasks)
+            
+            for result in results:
+                if result:
+                    accumulated_data.append(result)
+            
+            # Check if we hit the 1000 TG limit
+            if len(accumulated_data) >= BATCH_SIZE:
+                filename = f"scraped_direct_batch_{batch_count}.csv"
+                headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
+
+                with open(filename, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(headers)
+                    writer.writerows(accumulated_data[:BATCH_SIZE]) # Take exactly BATCH_SIZE
+
+                send_csv_to_telegram(filename)
                 
-                # Check if we hit the 1000 TG limit
-                if len(accumulated_data) >= BATCH_SIZE:
-                    filename = f"scraped_direct_batch_{batch_count}.csv"
-                    headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
+                # Keep any leftover items that pushed us over 1000
+                accumulated_data = accumulated_data[BATCH_SIZE:]
+                batch_count += 1
 
-                    with open(filename, 'w', newline='', encoding='utf-8') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(headers)
-                        writer.writerows(accumulated_data)
-
-                    send_csv_to_telegram(filename)
-                    
-                    # Clear the list safely to prepare for the next batch
-                    accumulated_data.clear()
-                    batch_count += 1
-
-        # Send any leftover data that didn't reach the 1000 mark at the very end
+        # Send any leftover data at the end
         if accumulated_data:
             filename = f"scraped_direct_batch_final.csv"
             headers = ["Title", "Channel Name", "Tags", "Duration (sec)", "Total Views", "Likes", "Dislikes", "Thumbnail URL", "Preview URL", "Page URL"]
