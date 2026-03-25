@@ -16,15 +16,9 @@ TELEGRAM_CHAT_ID = "7369364451"
 
 # Your Firebase Database URL
 FIREBASE_DB_URL = "https://xhamster-70a9b-default-rtdb.firebaseio.com"
-
-# Kept solely for checking if a video already exists in these legacy nodes
-LEGACY_CHANNELS = [
-    "Perv-city", "pantyhose-me-porn-videos", "pro-am-entertainment", "milf-bundle", "karups-older-women", "cuckold-milf", "old-x", "banned-sex-tapes", "mstx", "sylvia-sucked", "exxx-teens", "pascals-sub-sluts", "grandmams", "john-tron-x", "amateur-lapdancer", "blacks-on-blondes", "voyeur-house-tv", "hard-x", "king-of-amateur", "adult-auditions", "vintage-usa", "creampie-in-asia", "celeb-porn-archive", "dire-desires", "older-woman-fun", "jeffs-models", "hollandsche-passie", "madbros", "18-year-old-indian", "jax-slay-her", "only-full-porn-movie", "fuck-me-hard", "nasty-matures-and-dirty-grannies-club", "monger-in-asia", "property-sex", "old-goes-young", "tabu-film", "jav-official", "busty-bexx", "asian-porn-collection", "darrenblazeent", "czech-taxi", "missax", "the-upper-floor-by-kink", "wowgirls", "ugly-but-hot", "erotica-x", "cum4k", "xlgirls", "super-babes", "lusty-grandmas", "heavy-on-hotties", "she-got-butt-fucked", "family-x", "femdom-austria", "aunt-judys", "she-seduced-me", "my-porn-family", "centoxcentovod", "sugar-daddy-porn", "wicked-sexy-melanie", "40somethingmag", "big-tits-world", "luxure", "xtime-grannies", "breedme", "anal-mom", "anilos", "red-bottom-productions", "sperm-mania", "homemade-wives", "asian-milfs-n-teens", "vere-casalinghe-italia", "mommy4k", "my-baby-sitters-club", "bratty-milf", "oldies-privat", "smooth-time", "samurai-from-japan-with-passion", "twistys-network", "brutal-x", "tampa-bukkake-faphouse", "hussie-pass", "hardcore-gangbang-by-kink", "true-anal", "beate-uhse-movie", "lustery-channel", "theflourishxxx", "real-couples-channel", "girls-rimming", "horror-porn", "video-torino-erotica", "porn-india-studio", "your-uncut", "girlcum", "dogg-vision", "kingsofamateur", "british-blue-movies", "casting-girls-and-first-porno", "all-about-pee"
-]
-
 BASE_DOMAIN = "https://xhamster45.desi"
 
-# New constraints
+# Limits & Bounds
 VIDEO_CONCURRENCY_LIMIT = 100
 START_ID = 1
 END_ID = 22875
@@ -32,6 +26,7 @@ BATCH_SIZE = 1000
 # -----------------------------------
 
 PROXY_POOL = []
+DYNAMIC_NODES = []
 
 def send_csv_to_telegram(filepath):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
@@ -98,41 +93,51 @@ async def fetch_html_zero_loss(cffi_session, url):
             if proxy_url in PROXY_POOL:
                 PROXY_POOL.remove(proxy_url)
 
-async def check_channel(fb_session, channel, video_id):
-    """Helper to check if video exists in a specific legacy channel node"""
-    channel_node_url = f"{FIREBASE_DB_URL}/{channel}/{video_id}.json"
+async def check_firebase_node(fb_session, node_name, video_id):
+    """Helper to check if video exists in a specific Firebase node"""
+    node_url = f"{FIREBASE_DB_URL}/{node_name}/{video_id}.json"
     try:
-        async with fb_session.get(channel_node_url) as check_resp:
+        async with fb_session.get(node_url) as check_resp:
             if await check_resp.json() is not None:
                 return True
     except:
         pass
     return False
 
+async def fetch_dynamic_nodes(fb_session):
+    """Fetches top-level keys from Firebase to use as dynamic channel/node lists."""
+    print("🔍 Fetching dynamic database structure from Firebase...")
+    try:
+        # shallow=true fetches just the keys, saving massive bandwidth
+        async with fb_session.get(f"{FIREBASE_DB_URL}/.json?shallow=true") as resp:
+            data = await resp.json()
+            if data:
+                # Get all root nodes, filter out 'all' since we check that separately
+                nodes = [key for key in data.keys() if key != "all"]
+                print(f"✅ Found {len(nodes)} dynamic root nodes in Firebase: {', '.join(nodes[:5])}...")
+                return nodes
+    except Exception as e:
+        print(f"⚠️ Error fetching dynamic nodes: {e}")
+    return []
+
 async def process_single_video(cffi_session, fb_session, semaphore, video_id_num):
     video_id = str(video_id_num)
-    
-    # Using format requested. If standard tube format is required, change to f"{BASE_DOMAIN}/videos/{video_id}"
     url = f"{BASE_DOMAIN}/{video_id}" 
 
     async with semaphore:
-        # 1. CHECK FIREBASE 'all' NODE FIRST (Fastest)
-        all_node_url = f"{FIREBASE_DB_URL}/all/{video_id}.json"
-        try:
-            async with fb_session.get(all_node_url) as check_resp:
-                if await check_resp.json() is not None:
-                    print(f"   ⏭️ Skipped: {video_id} is already in /all node.")
-                    return None
-        except:
-            pass
-
-        # 2. CHECK ALL LEGACY CHANNEL NODES (Concurrently to save time)
-        channel_checks = [check_channel(fb_session, ch, video_id) for ch in LEGACY_CHANNELS]
-        channel_results = await asyncio.gather(*channel_checks)
-        
-        if any(channel_results):
-            print(f"   ⏭️ Skipped: {video_id} is already in a legacy channel node.")
+        # 1. CHECK FIREBASE 'all' NODE FIRST (Fastest check)
+        if await check_firebase_node(fb_session, "all", video_id):
+            print(f"   ⏭️ Skipped: {video_id} is already in /all node.")
             return None
+
+        # 2. CHECK ALL DYNAMIC NODES CONCURRENTLY
+        if DYNAMIC_NODES:
+            node_checks = [check_firebase_node(fb_session, node, video_id) for node in DYNAMIC_NODES]
+            node_results = await asyncio.gather(*node_checks)
+            
+            if any(node_results):
+                print(f"   ⏭️ Skipped: {video_id} is already in a dynamic channel node.")
+                return None
 
         # 3. SCRAPE THE DATA
         html = await fetch_html_zero_loss(cffi_session, url)
@@ -204,7 +209,7 @@ async def process_single_video(cffi_session, fb_session, semaphore, video_id_num
         }
 
         try:
-            async with fb_session.put(all_node_url, json=firebase_payload) as put_resp:
+            async with fb_session.put(f"{FIREBASE_DB_URL}/all/{video_id}.json", json=firebase_payload) as put_resp:
                 if put_resp.status == 200:
                     print(f"   🔥 Saved to DB (/all): {title[:20]}...")
         except Exception as e:
@@ -229,7 +234,7 @@ async def start_dummy_server():
 # ---------------------------------------
 
 async def main_async():
-    global PROXY_POOL
+    global PROXY_POOL, DYNAMIC_NODES
     
     await start_dummy_server()
     
@@ -242,6 +247,9 @@ async def main_async():
     connector = aiohttp.TCPConnector(limit=5000)
 
     async with AsyncSession() as cffi_session, aiohttp.ClientSession(connector=connector) as fb_session:
+        # Fetch the dynamic nodes right at the start
+        DYNAMIC_NODES = await fetch_dynamic_nodes(fb_session)
+
         # Create all tasks upfront
         tasks = [
             process_single_video(cffi_session, fb_session, video_semaphore, vid_id)
